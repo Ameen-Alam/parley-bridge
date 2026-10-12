@@ -1,0 +1,21 @@
+[project]
+name = "parley-bridge"
+version = "0.1.0"
+description = "The Parley bridge: an MCP server any assistant can run, connected to the relay. Started from c2chat."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "parley-common",
+    "mcp>=1.2,<2",
+    "httpx>=0.27",
+    "websockets>=13",
+]
+
+[project.scripts]
+parley-bridge = "parley_bridge.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/parley_bridge"]
