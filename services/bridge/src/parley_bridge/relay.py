@@ -21,6 +21,14 @@ Routes used, all built by earlier tasks except the send:
   "retry_at": <time>?}`` with the record's codes (``not-connected``, ``blocked``,
   ``over-limit``, ``ended``, ``paused``, ``bounce-limit``, ``recipient-cap``,
   ``rate-limited``; ``held`` for a hold).
+- ``GET /devices/me/recipients`` (T-0052): who the assistant may message. Proven like
+  ``POST /connect/session``: a challenge from ``POST /connect/challenge`` and the device
+  key's signature over it, sent as the headers ``X-Parley-Device``, ``X-Parley-Challenge``
+  and ``X-Parley-Signature``. The answer is ``{"type": "recipients", "permission_id",
+  "level", "recipients": [{"id", "name", "kind"}], "count", "messages_left",
+  "wakeups_left", "day_end", "end_date", "paused"}``; a refusal carries the connection's
+  codes (``bad-challenge``, ``bad-signature``, ``revoked-device``) or ``ended`` when no
+  permission is in force.
 """
 
 from __future__ import annotations
@@ -32,6 +40,10 @@ import httpx
 
 PAIRING_HEADER = "X-Parley-Pairing"
 MESSAGES_PATH = "/messages"
+RECIPIENTS_PATH = "/devices/me/recipients"
+DEVICE_HEADER = "X-Parley-Device"
+CHALLENGE_HEADER = "X-Parley-Challenge"
+SIGNATURE_HEADER = "X-Parley-Signature"
 POLL_WAIT_SECONDS = 25.0
 """The relay's longest poll (its ``MAX_WAIT_SECONDS``)."""
 
@@ -120,6 +132,20 @@ class RelayClient:
             "POST",
             MESSAGES_PATH,
             json={"device_id": device_id, "envelope": envelope, "signature": signature},
+        )
+
+    # ------------------------------------------------------------ recipients (T-0052)
+
+    async def recipients(self, device_id: str, challenge: str, signature: str) -> dict[str, Any]:
+        """Who the device may message, proven with its key over a connection challenge."""
+        return await self._call(
+            "GET",
+            RECIPIENTS_PATH,
+            headers={
+                DEVICE_HEADER: device_id,
+                CHALLENGE_HEADER: challenge,
+                SIGNATURE_HEADER: signature,
+            },
         )
 
     # ------------------------------------------------------------ the one request path

@@ -1,4 +1,5 @@
-"""The two tools behind the MCP server: ``check_inbox`` and ``send`` (criteria 1, 4, 5).
+"""The tools behind the MCP server: ``check_inbox``, ``send`` (criteria 1, 4, 5) and
+``recipients`` (T-0052).
 
 Started from ``reference/c2chat/c2chat.py``: the result fields (``addressed_to_me``,
 ``count``, ``messages``, ``ok``, ``reason``), the read cursor (a message is handed over
@@ -17,6 +18,14 @@ for what comes in and ``POST /messages`` for what goes out.
   code in ``reason`` (``not-connected``, ``over-limit``, ``ended``, ``paused``,
   ``bounce-limit``, ``recipient-cap``, ``held``, and the record's others) so the
   assistant acts on it and never retries by itself (story 4.13, power user condition).
+- ``recipients()``: who the assistant may message, from the relay's
+  ``GET /devices/me/recipients`` (T-0052): the recipients its owner picked, each as
+  ``id``, ``name`` (as the contact gave it; null when none is known or for a group) and
+  ``kind``, with the permission's level and the day's counts left. The relay proves the
+  device by its key over a connection challenge, the same proof the connection makes.
+  The list says nothing about anyone beyond those three fields (product rule 5); the
+  owner's own id is never on it (ruling 11). ``ok: false`` carries the relay's code
+  (``ended`` when no permission is in force, ``revoked-device``, ...) or the bridge's.
 - ``/resolve`` and ``/reopen`` change the thread's state only when the owner's own side
   sends or receives them; in a body from another owner they are text like any other
   (product rule 4: an untrusted body never changes behaviour) and the message is marked
@@ -41,7 +50,7 @@ from collections import deque
 from typing import Any
 
 from parley_bridge.config import Settings
-from parley_bridge.connection import Connection, Received
+from parley_bridge.connection import ChallengeError, Connection, Received, sign_challenge
 from parley_bridge.keys import DeviceKey
 from parley_bridge.relay import RelayClient, RelayRefusedError, RelayUnreachableError, clean
 from parley_common import signing
@@ -238,6 +247,51 @@ class Bridge:
             return _decision(False, envelope, "held", answer)
         log.info("send accepted request_id=%s", envelope.request_id)
         return _decision(True, envelope, None, answer)
+
+    # ------------------------------------------------------------ recipients (T-0052)
+
+    async def recipients(self) -> dict[str, Any]:
+        """Who this assistant may message now: the relay's list, verbatim but for the
+        terminal-safe cleaning of every string, with ``ok`` and ``decided_by``."""
+        try:
+            asked = await self._client.challenge()
+            challenge = clean(asked.get("challenge"), 64)
+            signature = sign_challenge(self.key, challenge, self.connection.payload_format)
+            answer = await self._client.recipients(self.key.device_id, challenge, signature)
+        except ChallengeError:
+            return _refused("malformed", "the relay's challenge has a shape the bridge refuses")
+        except RelayRefusedError as error:
+            log.info("recipients refused code=%s", error.code)
+            return {"ok": False, "reason": error.code, "status": "refused", "decided_by": "relay"}
+        except RelayUnreachableError:
+            log.info("recipients failed: relay unreachable")
+            return _refused("relay-unreachable", "the relay did not answer; try again later")
+        raw = answer.get("recipients")
+        listed = [
+            {
+                "id": clean(item.get("id")),
+                "name": None if item.get("name") is None else clean(item.get("name")),
+                "kind": clean(item.get("kind"), 16),
+            }
+            for item in (raw if isinstance(raw, list) else [])
+            if isinstance(item, dict) and clean(item.get("id"))
+        ]
+        result: dict[str, Any] = {
+            "ok": True,
+            "decided_by": "relay",
+            "count": len(listed),
+            "recipients": listed,
+            "level": clean(answer.get("level"), 16) or None,
+            "permission_id": clean(answer.get("permission_id"), 64) or None,
+        }
+        for key in ("messages_left", "wakeups_left"):
+            value = answer.get(key)
+            result[key] = value if isinstance(value, int) and not isinstance(value, bool) else None
+        for key in ("day_end", "end_date"):
+            result[key] = clean(answer.get(key), 40) or None
+        result["paused"] = answer.get("paused") is True
+        log.info("recipients listed count=%d", len(listed))
+        return result
 
     def _thread_for(self, reply_to: str | None) -> str | None:
         if not reply_to:

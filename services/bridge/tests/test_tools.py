@@ -127,7 +127,7 @@ def test_check_inbox_keeps_c2chat_fields_and_hands_each_message_once(tmp_path: A
 def test_the_two_tools_are_registered_and_answer_through_the_mcp_server(tmp_path: Any) -> None:
     async def scenario() -> None:
         tools = {tool.name for tool in await server.mcp.list_tools()}
-        assert tools == {"check_inbox", "send"}
+        assert tools == {"check_inbox", "send", "recipients"}
         bench = Bench(tmp_path)
         link = await bench.start()
         await bench.push(link, wakeup("w1", "hello"))

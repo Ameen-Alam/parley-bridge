@@ -1,4 +1,5 @@
-"""The Parley bridge: an MCP server that gives any assistant ``check_inbox`` and ``send``.
+"""The Parley bridge: an MCP server that gives any assistant ``check_inbox``, ``send`` and
+``recipients``.
 
 Started from ``reference/c2chat/c2chat.py`` (T-0009; stories 9.1 to 9.5, 9.7, 4.13 and
 4.14; the standards table's MCP row; the OpenClaw maintainer condition, untrusted label
@@ -12,7 +13,7 @@ The pieces: :mod:`parley_bridge.config` (environment only), :mod:`parley_bridge.
 dependency), :mod:`parley_bridge.pairing` (``parley-bridge pair``),
 :mod:`parley_bridge.relay` (the HTTP side, the only network destination),
 :mod:`parley_bridge.connection` (WebSocket with long-poll fallback, reconnect, wake
-command, acknowledgement), :mod:`parley_bridge.bridge` (the two tools) and
+command, acknowledgement), :mod:`parley_bridge.bridge` (the three tools) and
 :mod:`parley_bridge.server` (the MCP server and the command line).
 
 Rules kept everywhere: no message text on disk or in a log line; every limit is the

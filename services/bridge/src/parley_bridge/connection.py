@@ -18,6 +18,9 @@ reliability rows; T-0007's wire protocol in :mod:`parley_relay.connection`):
   ``bare`` explicitly. In both forms the challenge must decode to exactly
   :data:`CHALLENGE_BYTES` bytes, so a hostile relay can never obtain a device-key
   signature over bytes of its choosing (such as an envelope).
+- The WebSocket's TCP connection comes from :mod:`parley_bridge.dial`, which races the
+  relay's IPv6 and IPv4 addresses, so a host without working IPv6 still connects
+  (T-0053); the long poll's HTTP client does the same.
 - A dropped link is reopened with a backoff of 1, 2, 4 ... 60 seconds, each wait with
   about 25 percent jitter, and the backoff resets only after a link survived
   :data:`STABLE_SECONDS` (6b). Two bridges at Gate 1 reconnecting after a relay restart
@@ -48,6 +51,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from parley_bridge.config import Settings
+from parley_bridge.dial import DIALER, Dialer
 from parley_bridge.keys import DeviceKey
 from parley_bridge.relay import (
     POLL_WAIT_SECONDS,
@@ -211,13 +215,32 @@ def _close_reason(error: Any) -> str:
     return reason or "disconnect"
 
 
-async def open_websocket(settings: Settings, key: DeviceKey, payload_format: str) -> Link:
-    """Open ``WS /connect`` and answer the challenge. Outbound; no port is opened here."""
+async def _dial_websocket(url: str, dialer: Dialer) -> Any:
+    """``connect`` over a socket the dialer raced to the first address that answered
+    (T-0053). With a proxy in the environment websockets dials the proxy itself."""
     from websockets.asyncio.client import connect
+    from websockets.proxy import get_proxy
+    from websockets.uri import parse_uri
+
+    uri = parse_uri(url)
+    if get_proxy(uri) is not None:
+        return await connect(url, open_timeout=15, max_size=2**22)
+    sock = await dialer.open_socket(uri.host, uri.port)
+    try:
+        return await connect(url, sock=sock, open_timeout=15, max_size=2**22)
+    except BaseException:
+        sock.close()
+        raise
+
+
+async def open_websocket(
+    settings: Settings, key: DeviceKey, payload_format: str, dialer: Dialer = DIALER
+) -> Link:
+    """Open ``WS /connect`` and answer the challenge. Outbound; no port is opened here."""
     from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidURI
 
     try:
-        socket = await connect(settings.websocket_url, open_timeout=15, max_size=2**22)
+        socket = await _dial_websocket(settings.websocket_url, dialer)
     except InvalidHandshake as error:
         raise UpgradeRefusedError("the relay did not accept the WebSocket upgrade") from error
     except (OSError, InvalidURI, TimeoutError) as error:
@@ -344,11 +367,11 @@ async def open_poll(client: RelayClient, key: DeviceKey, payload_format: str) ->
     return PollLink(client, token)
 
 
-def default_opener(settings: Settings, client: RelayClient) -> Opener:
+def default_opener(settings: Settings, client: RelayClient, dialer: Dialer = DIALER) -> Opener:
     async def opener(transport: str, key: DeviceKey, payload_format: str) -> Link:
         if transport == POLL:
             return await open_poll(client, key, payload_format)
-        return await open_websocket(settings, key, payload_format)
+        return await open_websocket(settings, key, payload_format, dialer)
 
     return opener
 
@@ -408,6 +431,7 @@ class State:
     code: str | None = None
     since: str = field(default_factory=now_iso)
     reconnects: int = 0
+    """Retries so far: after a dropped link and after a failed attempt alike (T-0053)."""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -497,7 +521,6 @@ class Connection:
                 lived = asyncio.get_running_loop().time() - opened
                 self._link = None
                 await link.close()
-                self.state.reconnects += 1
                 log.info("link ended reason=%s lived=%.1fs", reason, lived)
                 if reason == UNLINKED:
                     self._set_state("unlinked", link.transport, reason)
@@ -510,6 +533,7 @@ class Connection:
                     delay = MIN_BACKOFF
                 if self._stopping.is_set():
                     break
+            self.state.reconnects += 1  # a retry after a drop or a failed attempt alike
             await self._wait(delay * self._jitter())
             delay = min(delay * 2, MAX_BACKOFF)
         self._set_state("stopped", self.state.transport)
@@ -519,6 +543,12 @@ class Connection:
         link, self._link = self._link, None
         if link is not None:
             await link.close()
+
+    @property
+    def payload_format(self) -> str:
+        """The challenge payload form the relay accepts, ``domain`` or ``bare``: what the
+        connection signs with, and what a one-off proof (``recipients``) must sign with."""
+        return self._payload_format
 
     def _transport(self) -> str:
         if self.settings.transport == POLL:

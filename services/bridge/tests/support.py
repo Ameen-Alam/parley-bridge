@@ -247,7 +247,7 @@ def relay_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[RelayServ
 
     from parley_relay.app import app
     from parley_relay.connection import StaticRegistry
-    from parley_relay.permissions import StaticApprovals
+    from parley_relay.permissions import StaticApprovals, StaticNames
     from parley_relay.permissions.router import HeaderPrincipals
     from parley_relay.refusals import StaticAccountStatus
 
@@ -257,11 +257,19 @@ def relay_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[RelayServ
     os.environ["PARLEY_DB_PATH"] = str(db_path)
     os.environ["PARLEY_ORIGIN"] = "https://relay.example"
     os.environ["PARLEY_ALLOW_EPHEMERAL_SIGNING_KEY"] = "1"
-    app.state.pairing_principals = HeaderPrincipals()
-    app.state.permissions_principals = HeaderPrincipals()
-    app.state.permissions_approvals = StaticApprovals(SECRETS)
-    app.state.refusals_accounts = StaticAccountStatus()
-    app.state.connection_registry = StaticRegistry()
+    stand_ins: dict[str, Any] = {
+        "pairing_principals": HeaderPrincipals(),
+        "permissions_principals": HeaderPrincipals(),
+        "permissions_approvals": StaticApprovals(SECRETS),
+        "permissions_names": StaticNames(NAMES),
+        "refusals_accounts": StaticAccountStatus(),
+        "connection_registry": StaticRegistry(),
+    }
+    # The app is the one module object every test file shares: put back whatever was on
+    # its state before, so the web app's tests after this file see their own wiring.
+    saved_state = {name: getattr(app.state, name, _ABSENT) for name in stand_ins}
+    for name, value in stand_ins.items():
+        setattr(app.state, name, value)
     port = _free_port()
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="on")
     server = uvicorn.Server(config)
@@ -281,6 +289,12 @@ def relay_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[RelayServ
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+        for name, value in saved_state.items():
+            if value is _ABSENT:
+                if hasattr(app.state, name):
+                    delattr(app.state, name)
+            else:
+                setattr(app.state, name, value)
 
 
 def stamped_envelope(
@@ -296,8 +310,14 @@ def stamped_envelope(
     return envelope.stamped_by_relay(owner=sender_owner, sent_by=sender_device, permission_ref="p")
 
 
+_ABSENT = object()
+"""Marks an ``app.state`` attribute the relay fixture found unset, to unset it again."""
 SECRETS = {f"owner-send-{letter}": f"lock-{letter}" for letter in "abc"}
 """Owners the send test links; the test-only approval verifier knows their secrets."""
+NAMES: dict[str, tuple[str, str | None]] = {
+    f"owner-send-{letter}": (f"Owner Send {letter.upper()}", None) for letter in "abc"
+}
+"""Their display names as typed, for the T-0034 name source; made up, nobody's."""
 _NONCES = iter(range(1, 10_000))
 
 
@@ -332,7 +352,7 @@ def connect_owners(relay: RelayServer, a: str, b: str) -> None:
         assert accepted.status_code == 200, accepted.text
 
 
-def link_assistant(relay: RelayServer, owner_id: str, device_id: str, recipients: list[str]) -> str:
+def link_assistant(relay: RelayServer, owner_id: str, device_id: str, recipients: list[Any]) -> str:
     """The owner approves the assistant's permission for ``recipients`` (CR-08)."""
     import httpx
 

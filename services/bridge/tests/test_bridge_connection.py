@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import socket as stdlib_socket
 import sys
 import time
 from pathlib import Path
@@ -47,6 +48,7 @@ from parley_bridge.connection import (
     default_opener,
     open_poll,
 )
+from parley_bridge.dial import Dialer
 from parley_bridge.keys import DeviceKey
 from parley_bridge.relay import RelayClient
 from parley_common import signing
@@ -217,7 +219,7 @@ def test_a_dropped_link_is_reopened_and_the_delay_resets_after_a_success(tmp_pat
         while len(opener.links) < 2:
             await asyncio.sleep(0)
         assert sleep.delays == [1, 2]  # 1 after the drop, 2 after the failed attempt
-        assert connection.state.reconnects == 1
+        assert connection.state.reconnects == 2  # the drop and the failed attempt
         await connection.stop()
         await task
 
@@ -484,10 +486,17 @@ def test_open_websocket_closes_the_socket_when_the_relay_sends_no_challenge(
 
     monkeypatch.setattr(websockets.asyncio.client, "connect", fake_connect)
 
+    unused = stdlib_socket.socket()
+
+    class NoDialer(Dialer):
+        async def open_socket(self, host: str, port: int) -> stdlib_socket.socket:
+            return unused
+
     async def scenario() -> None:
         with pytest.raises(UnavailableError):
-            await open_websocket(make_settings(tmp_path), make_key(), "bare")
+            await open_websocket(make_settings(tmp_path), make_key(), "bare", NoDialer())
         assert socket.closed is True
+        unused.close()
 
     run(scenario())
 
