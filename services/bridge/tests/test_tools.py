@@ -213,6 +213,48 @@ def test_send_through_the_real_relay_route_accepted_and_refused(relay: Any, tmp_
     run(scenario())
 
 
+def test_the_bridge_names_one_recipient_and_the_relay_adds_the_owners_phones(
+    relay: Any, tmp_path: Any
+) -> None:
+    """T-0111 criterion 2 (story 5.7; product rule 3): the bridge chooses no receiver. Its
+    send names the one recipient and posts one envelope; the relay delivers it to the
+    recipient's devices and to every active person device of the sending assistant's
+    owner, never back to the assistant. The envelope is plain text in the test, so the
+    bridge encrypts to nobody and needs no change: whatever the relay returns as the
+    receiving devices is what receives. The answer is the plain accepted one."""
+    from support import connect_owners, link_assistant
+
+    owner_c, owner_b = "owner-send-c", "owner-send-b"
+    key = make_key("copy-assistant-c")
+    phone_c, tablet_c, phone_b = "copy-phone-c", "copy-tablet-c", "copy-phone-b"
+    relay.registry.add_person_device(owner_c, phone_c)
+    relay.registry.add_person_device(owner_c, tablet_c)
+    relay.registry.add_assistant(owner_c, key.device_id, key.public_key)
+    relay.registry.add_person_device(owner_b, phone_b)
+    connect_owners(relay, owner_c, owner_b)
+    link_assistant(relay, owner_c, key.device_id, [owner_b])
+    settings = make_settings(tmp_path, relay_url=relay.url)
+
+    async def scenario() -> None:
+        client = RelayClient(httpx.AsyncClient(base_url=relay.url))
+        connection = Connection(key, settings, FakeOpener(), sleep=FastSleep())
+        bridge = Bridge(key, settings, connection, client)
+        try:
+            sent = await bridge.send(owner_b, "a question for the other assistant")
+            assert (sent["ok"], sent["status"], sent["decided_by"]) == (True, "accepted", "relay")
+            assert "reason" not in sent and "verb" not in sent
+            queue = relay.app.state.queue
+            for device in (phone_b, phone_c, tablet_c):
+                (message,) = [m for m in queue.pending_for(device) if m.request_id == sent["id"]]
+                assert tuple(message.envelope.to) == (owner_b,)  # the bridge named B alone
+                assert message.envelope.sent_by == key.device_id
+            assert all(m.request_id != sent["id"] for m in queue.pending_for(key.device_id))
+        finally:
+            await client.aclose()
+
+    run(scenario())
+
+
 def test_check_inbox_defaults_to_the_configured_history_limit(tmp_path: Any) -> None:
     """Reviewer item 10: PARLEY_BRIDGE_HISTORY_LIMIT applies when no limit is given."""
 
@@ -269,6 +311,35 @@ def test_send_signs_the_envelope_and_returns_the_relay_decision_verbatim(tmp_pat
         down = await bench.bridge.send("owner-b", "no relay")
         assert down["ok"] is False and down["reason"] == "relay-unreachable"
         assert down["decided_by"] == "bridge" and "relay-unreachable" in BRIDGE_REASONS
+        await bench.client.aclose()
+
+    run(scenario())
+
+
+def test_a_held_answer_without_a_retry_time_reads_held_as_before(tmp_path: Any) -> None:
+    """T-0114 criterion 3 (rule 5; CR-19): the relay answers a hold on the other side
+    with retry_at null, the same for every reason. The bridge reads it as before: not
+    ok, reason held, status held, no retry time made up, and it does not retry."""
+
+    async def scenario() -> None:
+        bench = Bench(tmp_path)
+        for answer in (
+            {"type": "held", "request_id": "r", "code": "held", "retry_at": None},
+            {"type": "held", "request_id": "r", "code": "held"},
+        ):
+            bench.route.answer = (200, answer)
+            before = len(bench.route.posts)
+            held = await bench.bridge.send("owner-b", "held one")
+            assert held == {
+                "ok": False,
+                "id": held["id"],
+                "request_id": held["id"],
+                "thread": held["id"],
+                "decided_by": "relay",
+                "reason": "held",
+                "status": "held",
+            }
+            assert len(bench.route.posts) == before + 1  # one post, no retry by itself
         await bench.client.aclose()
 
     run(scenario())

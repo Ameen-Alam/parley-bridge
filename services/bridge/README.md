@@ -38,7 +38,9 @@ uv run parley-bridge pair --label "Sara's coding assistant"
 `pair` prints an eight-character code and a QR code (also written as a PNG whose path is
 printed; it is removed when pairing ends). In the Parley app choose *Link an assistant*,
 enter the code or scan the QR, and approve the permission sheet. The code lives ten
-minutes. When the app claims it the bridge stores the key and exits.
+minutes. The bridge stores the key and exits once you approve with your screen lock;
+if you press *Not now*, or leave the sheet without a choice, nothing is stored, the
+relay keeps no device for it, and `pair` says so: run it again for a new code.
 
 Other commands: `parley-bridge status` (is a key stored), `parley-bridge unlink` (delete
 the key file; the owner unlinks the assistant in the app), `parley-bridge run`

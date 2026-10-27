@@ -13,10 +13,10 @@ from typing import Any
 import httpx
 import pytest
 from support import (
-    OWNER_A,
     PRINCIPAL_HEADER,
     FastSleep,
     RelayServer,
+    link_assistant,
     make_settings,
     relay_server,  # noqa: F401 - the relay fixture, registered by import
     run,
@@ -28,6 +28,33 @@ from parley_common import signing
 
 CODE_LINE = re.compile(r"Pairing code: ([A-Z2-9]{4}) ([A-Z2-9]{4})")
 PNG_LINE = re.compile(r"QR image: (.+?) \(removed when pairing ends\)")
+
+
+OWNER = "owner-send-a"
+"""An owner the relay fixture's approval stand-in knows, so the test can approve."""
+
+
+async def _claim(relay: RelayServer, code: str, owner: str = OWNER) -> dict[str, Any]:
+    async with httpx.AsyncClient(base_url=relay.url) as http:
+        response = await http.post(
+            "/pairing/claim",
+            json={"code": code, "display_name": "Sara, test display name"},
+            headers={PRINCIPAL_HEADER: f"owner:{owner}"},
+        )
+    assert response.status_code == 200, response.json()
+    data: dict[str, Any] = response.json()
+    return data
+
+
+def _approve(relay: RelayServer, claimed: dict[str, Any], owner: str = OWNER) -> None:
+    """The owner approves the sheet (T-0118: the link is made here, not at the claim). The
+    fixture's permissions read devices from its stand-in directory, so the claimed device
+    is put there first."""
+    device = claimed["device"]
+    relay.registry.add_assistant(
+        owner, device["id"], signing.PublicKey.from_base64url(device["public_key"])
+    )
+    link_assistant(relay, owner, device["id"], [{"id": owner, "kind": "owner"}])
 
 
 def test_pair_shows_code_and_qr_then_stores_the_key_owner_only(
@@ -47,14 +74,12 @@ def test_pair_shows_code_and_qr_then_stores_the_key_owner_only(
         png_match = next(m for m in (PNG_LINE.search(line) for line in lines) if m)
         png_path = Path(png_match.group(1))
         assert png_path.is_file() and png_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
-        async with httpx.AsyncClient(base_url=relay.url) as owner:
-            response = await owner.post(
-                "/pairing/claim",
-                json={"code": code, "display_name": "Sara, test display name"},
-                headers={PRINCIPAL_HEADER: f"owner:{OWNER_A}"},
-            )
-        assert response.status_code == 200, response.json()
-        data: dict[str, Any] = response.json()
+        data = await _claim(relay, code)
+        # Claimed is not linked (T-0118): the bridge keeps waiting and stores nothing.
+        await asyncio.sleep(pairing.POLL_INTERVAL + 0.5)
+        assert not settings.key_path.exists()
+        assert not any("Linked by" in line for line in lines)
+        await asyncio.to_thread(_approve, relay, data)
         data["png_path"] = str(png_path)
         return data
 
@@ -127,8 +152,11 @@ class ScriptedRelay:
         self.status_urls.append(str(request.url))
         state = self.statuses.pop(0)
         body: dict[str, Any] = {"type": "status", "id": "pid-1", "status": state}
-        if state == "claimed":
-            body.update({"device_id": "dev-9", "owner_display_name": "Owner", "linked": False})
+        if state == "linked":
+            body.update({"device_id": "dev-9", "owner_display_name": "Owner", "linked": True})
+        if state.startswith("claimed"):
+            # A relay from before T-0118: claimed, and linked once approved.
+            body.update({"status": "claimed", "device_id": "dev-9", "linked": state.endswith("+")})
         return httpx.Response(200, json=body)
 
 
@@ -158,7 +186,7 @@ def test_start_backs_off_on_already_open_busy_and_rate_limited(tmp_path: Path) -
             refused(429, "rate-limited"),
             started(),
         ],
-        ["waiting", "claimed"],
+        ["waiting", "linked"],
     )
     client = RelayClient(
         httpx.AsyncClient(transport=httpx.MockTransport(script.handler), base_url="http://relay")
@@ -185,7 +213,7 @@ def test_the_first_code_is_kept_until_it_expires_and_the_id_is_the_poll_handle(
 ) -> None:
     script = ScriptedRelay(
         [started("AAAABBBB", "pid-1"), started("CCCCDDDD", "pid-2")],
-        ["waiting", "waiting", "waiting", "expired", "waiting", "claimed"],
+        ["waiting", "waiting", "waiting", "expired", "waiting", "linked"],
     )
     client = RelayClient(
         httpx.AsyncClient(transport=httpx.MockTransport(script.handler), base_url="http://relay")
@@ -222,7 +250,7 @@ def test_a_vanished_pairing_counts_as_expired_and_transient_errors_keep_polling(
             raise httpx.ConnectError("blip")
         if calls["status"] == 2:
             return httpx.Response(500, json={"type": "refused", "code": "oops"})
-        body = {"type": "status", "id": "pid-1", "status": "claimed", "device_id": "dev-9"}
+        body = {"type": "status", "id": "pid-1", "status": "linked", "device_id": "dev-9"}
         return httpx.Response(200, json=body)
 
     client = RelayClient(
@@ -241,3 +269,52 @@ def test_a_vanished_pairing_counts_as_expired_and_transient_errors_keep_polling(
 
     run(scenario())
     assert sleep.delays == [1, 2]
+
+
+def _scripted_pair(tmp_path: Path, statuses: list[str]) -> tuple[ScriptedRelay, Any, list[str]]:
+    script = ScriptedRelay([started()], statuses)
+    client = RelayClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(script.handler), base_url="http://relay")
+    )
+    settings = make_settings(tmp_path)
+    lines: list[str] = []
+
+    async def scenario() -> Any:
+        try:
+            return await pairing.pair(
+                client, settings, label=None, write=lines.append, sleep=FastSleep()
+            )
+        finally:
+            await client.aclose()
+
+    outcome: Any
+    try:
+        outcome = run(scenario())
+    except pairing.PairingError as error:
+        outcome = error
+    return script, (outcome, settings), lines
+
+
+def test_a_claim_is_no_link_until_approved_and_declined_stores_nothing(tmp_path: Path) -> None:
+    """T-0118: the bridge polls through the owner's sheet and stores its key only on
+    ``linked``; ``declined`` (Not now, or the sheet left) ends pairing with nothing kept."""
+    script, (outcome, settings), lines = _scripted_pair(
+        tmp_path, ["waiting", "waiting", "declined"]
+    )
+    assert isinstance(outcome, pairing.PairingError)
+    assert "did not approve" in str(outcome)
+    assert not settings.key_path.exists()
+    assert not any("Linked by" in line for line in lines)
+    assert script.statuses == []
+
+
+def test_an_older_relays_claim_waits_for_its_linked_flag(tmp_path: Path) -> None:
+    """A relay from before T-0118 says ``claimed`` at the claim: the bridge stores nothing
+    until the same status carries ``linked: true``."""
+    script, (outcome, settings), lines = _scripted_pair(
+        tmp_path, ["waiting", "claimed", "claimed", "claimed+"]
+    )
+    assert isinstance(outcome, keys.DeviceKey) and outcome.device_id == "dev-9"
+    assert keys.load(settings.key_path).device_id == "dev-9"
+    assert script.statuses == []
+    assert any("permission is approved" in line for line in lines)
