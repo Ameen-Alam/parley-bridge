@@ -246,7 +246,7 @@ def relay_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[RelayServ
     import uvicorn
 
     from parley_relay.app import app
-    from parley_relay.connection import StaticRegistry
+    from parley_relay.connection import StaticRegistry, StaticWakeups
     from parley_relay.permissions import StaticApprovals, StaticNames
     from parley_relay.permissions.router import HeaderPrincipals
     from parley_relay.refusals import StaticAccountStatus
@@ -264,6 +264,9 @@ def relay_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[RelayServ
         "permissions_names": StaticNames(NAMES),
         "refusals_accounts": StaticAccountStatus(),
         "connection_registry": StaticRegistry(),
+        # The transport tests queue for an assistant with no permission, which the
+        # permissions counter gives no wake-ups (T-0024): a stand-in counter here only.
+        "connection_wakeups": StaticWakeups(),
     }
     # The app is the one module object every test file shares: put back whatever was on
     # its state before, so the web app's tests after this file see their own wiring.

@@ -14,7 +14,7 @@ installs:
 - `packages/common/`
 - `services/bridge/`
 
-The tree was built from commit `29698d9f0edfe158372b79c5a12dea9c2050a59d` of the private Parley repository by its
+The tree was built from commit `3c75063bbd4b372e4fda310498432bf9200e7ced` of the private Parley repository by its
 `scripts/public_tree.py`, which copies only these directories and refuses anything else.
 The relay, the web app and the project's internal documents are not here.
 
@@ -56,6 +56,10 @@ lives ten minutes; when the app claims it, the bridge stores the device key (one
 bridge as an MCP server in your assistant; [services/bridge/README.md](services/bridge/README.md)
 shows the configuration for Claude Code, Codex CLI and OpenClaw, the two tools' exact
 shapes, every environment variable and what is kept where.
+
+## Checking a signed record offline
+
+`verify_record.py` checks a record the relay signed (a refusal, an approval or a notice acceptance) against the relay's key set, offline: `python verify_record.py parley-keys.json --records records.json` for an operator export, or `python verify_record.py parley-keys.json JWS` for one record. It needs PyNaCl only and contacts no host.
 
 ## Dependencies are pinned
 

@@ -16,7 +16,7 @@ dev = [
 [tool.uv]
 package = false
 # Every registry package pinned to the exact version the private repository's uv.lock
-# resolved at commit 29698d9f0edfe158372b79c5a12dea9c2050a59d; uv.lock is generated from these pins (T-0029).
+# resolved at commit 3c75063bbd4b372e4fda310498432bf9200e7ced; uv.lock is generated from these pins (T-0029).
 constraint-dependencies = [
     "annotated-doc==0.0.5",
     "annotated-types==0.8.0",
