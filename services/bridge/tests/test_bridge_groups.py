@@ -34,6 +34,7 @@ from support import (
 from parley_bridge import server
 from parley_bridge.bridge import (
     BRIDGE_REASONS,
+    GROUP_NAME_LABEL,
     RELAY_REASONS,
     UNTRUSTED_LABEL,
     UNTRUSTED_NOTICE,
@@ -172,7 +173,7 @@ def test_bridge_group_message_is_labelled_and_marks_the_mention(tmp_path: Any) -
         await bench.push(link, wakeup("w3", "a direct one"))
         direct = (await bench.bridge.check_inbox())["messages"][0]
         assert direct["group"] is None and direct["group_name"] is None
-        assert direct["mentioned"] is True and direct["mentions"] == []
+        assert direct["mentioned"] is True and "mentions" not in direct
         await bench.stop()
 
     run(scenario())
@@ -356,3 +357,119 @@ def test_readme_names_the_group_fields_and_bad_mention() -> None:
     text = README_PATH.read_text(encoding="utf-8")
     for word in ("mentions", "`group`", "`group_name`", "`mentioned`", "`bad-mention`"):
         assert word in text, word
+
+
+# ---------------------------------------------------------------- T-0154 follow-ups
+
+OWNER_LIKE_GROUP = "g-Zm9vYmFyYmF6cXV4"
+"""A made-up owner id in base64url form that happens to start with g-."""
+
+
+def test_an_owner_id_starting_with_g_is_not_a_group(tmp_path: Any) -> None:
+    """T-0154 criterion 1: an id the last recipients answer lists as kind owner is an
+    owner even when it starts with g-: reply_to is honoured and mentions are refused as
+    for any direct send. The g- form counts only for an id that answer did not list."""
+
+    async def scenario() -> None:
+        bench = Bench(tmp_path)
+        bench.relay.recipients = [
+            {"id": GROUP, "name": GROUP_NAME, "kind": "group"},
+            {"id": OWNER_LIKE_GROUP, "name": "Rowan Vale", "kind": "owner"},
+        ]
+        assert (await bench.bridge.recipients())["ok"] is True
+        link = await bench.start()
+        await bench.push(link, wakeup("w1", "a direct question", thread_id="thread-direct-1"))
+        item = (await bench.bridge.check_inbox())["messages"][0]
+        assert item["thread"] == "thread-direct-1"
+
+        sent = await bench.bridge.send(OWNER_LIKE_GROUP, "an answer", reply_to=item["id"])
+        assert sent["ok"] is True and sent["thread"] == "thread-direct-1"
+        envelope = bench.relay.posts[-1]["envelope"]
+        assert envelope["to"] == [OWNER_LIKE_GROUP]
+        assert envelope["thread_id"] == "thread-direct-1"
+
+        fresh = await bench.bridge.send(OWNER_LIKE_GROUP, "a new topic")
+        assert fresh["ok"] is True and fresh["thread"] != OWNER_LIKE_GROUP
+        assert fresh["thread"] == fresh["request_id"]
+
+        posts = len(bench.relay.posts)
+        refused = await bench.bridge.send(OWNER_LIKE_GROUP, "hello", mentions=[OTHER_ASSISTANT])
+        assert refused["ok"] is False and refused["reason"] == "malformed"
+        assert refused["decided_by"] == "bridge" and len(bench.relay.posts) == posts
+
+        unlisted = await bench.bridge.send("g-unlisted", "hello", mentions=[OTHER_ASSISTANT])
+        assert unlisted["ok"] is True and unlisted["thread"] == "g-unlisted"
+        await bench.stop()
+
+    run(scenario())
+
+
+def test_a_direct_message_never_takes_a_group_thread(tmp_path: Any) -> None:
+    """T-0154 criterion 2: a direct message (no group_id on the frame) whose sender-chosen
+    thread_id is a group id gets its own thread, its request id, and shares neither the
+    group's resolved state nor its loop guard; a direct reply to it, or a direct reply
+    whose reply_to leads to the group's thread, never uses the group id."""
+
+    async def scenario() -> None:
+        bench = Bench(tmp_path)
+        link = await bench.start()
+        resolved = await bench.bridge.send(GROUP, "/resolve")
+        assert resolved["ok"] is True and resolved["thread"] == GROUP
+
+        await bench.push(link, wakeup("w1", "a direct one", thread_id=GROUP))
+        direct = (await bench.bridge.check_inbox())["messages"][0]
+        assert direct["group"] is None
+        assert direct["thread"] == direct["id"] and direct["thread"] != GROUP
+        assert direct["resolved"] is False
+
+        reply = await bench.bridge.send(ASSISTANT_B, "a direct answer", reply_to=direct["id"])
+        assert reply["ok"] is True and reply["thread"] == direct["id"]
+        assert bench.relay.posts[-1]["envelope"]["thread_id"] == direct["id"]
+
+        await bench.push(link, wakeup("w2", "in the group", group_id=GROUP, mentioned=True))
+        in_group = (await bench.bridge.check_inbox())["messages"][0]
+        assert in_group["thread"] == GROUP and in_group["resolved"] is True
+
+        for reply_to in (in_group["id"], GROUP):
+            aside = await bench.bridge.send(ASSISTANT_B, "an aside", reply_to=reply_to)
+            assert aside["ok"] is True and aside["thread"] != GROUP
+            assert aside["thread"] == aside["request_id"]
+            assert bench.relay.posts[-1]["envelope"]["thread_id"] == aside["request_id"]
+        await bench.stop()
+
+    run(scenario())
+
+
+def test_group_name_is_labelled_untrusted(tmp_path: Any) -> None:
+    """T-0154 criterion 3: every group item labels its group_name as untrusted, whoever
+    sent the message, since the admin who typed the name may be another owner; mentions
+    appear only on group items, never on a direct one, even when its envelope has some."""
+
+    async def scenario() -> None:
+        bench = Bench(tmp_path)
+        me = bench.key.device_id
+        link = await bench.start()
+        await bench.push(
+            link,
+            wakeup(
+                "w1", "from my own side", group_id=GROUP, mentioned=True, from_other_owner=False
+            ),
+        )
+        await bench.push(
+            link, wakeup("w2", "from another owner", group_id=GROUP, mentions=[me], mentioned=True)
+        )
+        await bench.push(link, wakeup("w3", "a direct one", mentions=[me]))
+        own, other, direct = (await bench.bridge.check_inbox())["messages"]
+        assert own["untrusted"] is False and "label" not in own
+        for item in (own, other):
+            assert item["group_name"] == GROUP_NAME
+            assert item["group_name_label"] == GROUP_NAME_LABEL
+            assert "untrusted" in GROUP_NAME_LABEL.lower()
+        assert own["mentions"] == [] and other["mentions"] == [me]
+        assert direct["group"] is None and direct["group_name"] is None
+        assert "group_name_label" not in direct and "mentions" not in direct
+        await bench.stop()
+
+    run(scenario())
+    assert "group_name_label" in server.check_inbox.__doc__  # type: ignore[operator]
+    assert "`group_name_label`" in README_PATH.read_text(encoding="utf-8")
