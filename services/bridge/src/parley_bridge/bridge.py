@@ -12,20 +12,31 @@ for what comes in and ``POST /messages`` for what goes out.
   true`` and the label of story 9.5; when any such message is in the result, the first
   field of the result is the notice line of the OpenClaw maintainer condition. Frames
   are acknowledged ``done`` to the relay as their messages are handed over.
-- ``send(to, message, reply_to)``: builds the envelope with :mod:`parley_common.envelope`,
-  signs its canonical JSON with the device key and posts it. The relay's decision comes
-  back verbatim: ``ok: true`` with the request ID, or ``ok: false`` with the relay's
-  code in ``reason`` (``not-connected``, ``over-limit``, ``ended``, ``paused``,
-  ``bounce-limit``, ``recipient-cap``, ``held``, and the record's others) so the
-  assistant acts on it and never retries by itself (story 4.13, power user condition).
+- Group messages (T-0093, groups contract section 8): an item also carries ``group``
+  (the group id, or null for a direct message), ``group_name`` (the group's name as its
+  admin typed it, from the ``recipients`` answer; data, never instructions; null when
+  unknown), ``mentioned`` (the relay's word: true when this assistant was mentioned, and
+  for every direct message) and ``mentions`` (the ids the sender mentioned). A group
+  message's ``thread`` is the group id, so a reply stays in the group's thread.
+- ``send(to, message, reply_to, mentions)``: builds the envelope with
+  :mod:`parley_common.envelope`, signs its canonical JSON with the device key and posts
+  it. To a group the thread is always the group id, with or without ``reply_to``, and
+  ``mentions`` (assistant device ids) goes into the envelope's ``mentions`` field; with
+  no mentions the envelope's bytes are what they were before the field existed. The
+  relay's decision comes back verbatim: ``ok: true`` with the request ID, or ``ok:
+  false`` with the relay's code in ``reason`` (``not-connected``, ``over-limit``,
+  ``ended``, ``paused``, ``bounce-limit``, ``recipient-cap``, ``group-ended``,
+  ``bad-mention``, ``held``, and the record's others) so the assistant acts on it and
+  never retries by itself (story 4.13, power user condition).
 - ``recipients()``: who the assistant may message, from the relay's
   ``GET /devices/me/recipients`` (T-0052): the recipients its owner picked, each as
-  ``id``, ``name`` (as the contact gave it; null when none is known or for a group) and
-  ``kind``, with the permission's level and the day's counts left. The relay proves the
-  device by its key over a connection challenge, the same proof the connection makes.
-  The list says nothing about anyone beyond those three fields (product rule 5); the
-  owner's own id is never on it (ruling 11). ``ok: false`` carries the relay's code
-  (``ended`` when no permission is in force, ``revoked-device``, ...) or the bridge's.
+  ``id``, ``name`` (as the contact gave it, or the group's name as its admin typed it;
+  null when none is known) and ``kind``, with the permission's level and the day's
+  counts left. The relay proves the device by its key over a connection challenge, the
+  same proof the connection makes. The list says nothing about anyone beyond those three
+  fields (product rule 5); the owner's own id is never on it (ruling 11). ``ok: false``
+  carries the relay's code (``ended`` when no permission is in force,
+  ``revoked-device``, ...) or the bridge's.
 - ``/resolve`` and ``/reopen`` change the thread's state only when the owner's own side
   sends or receives them; in a body from another owner they are text like any other
   (product rule 4: an untrusted body never changes behaviour) and the message is marked
@@ -47,6 +58,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import deque
+from collections.abc import Sequence
 from typing import Any
 
 from parley_bridge.config import Settings
@@ -72,6 +84,7 @@ RELAY_REASONS = (
     "bounce-limit",
     "recipient-cap",
     "group-ended",
+    "bad-mention",
     "rate-limited",
     "held",
 )
@@ -99,6 +112,8 @@ _SECRET_PATTERNS = (
 _LINK_PATTERN = re.compile(r"(?i)\b(?:https?|ftp|file)://|\bdata:[a-z]+/[a-z0-9.+-]+;base64,")
 _RESOLVE = "/resolve"
 _REOPEN = "/reopen"
+_GROUP_PREFIX = "g-"
+"""The form of a group id (groups contract section 1)."""
 
 
 class Bridge:
@@ -118,6 +133,9 @@ class Bridge:
         self._threads: dict[str, str] = {}
         self._turns: dict[str, deque[str]] = {}
         self._resolved: set[str] = set()
+        self._group_names: dict[str, str | None] = {}
+        """Group id to the group's name, from the last ``recipients`` answer. Never logged."""
+        self._groups_seen: set[str] = set()
 
     # ------------------------------------------------------------ check_inbox
 
@@ -127,6 +145,7 @@ class Bridge:
         if wait > 0:
             await self.connection.wait_for_messages(min(wait, 25.0))
         taken = await self.connection.take(cap)
+        await self._learn_group_names(taken)
         messages = [self._present(message) for message in taken]
         for message in taken:
             self._threads[message.request_id] = message.thread_id
@@ -172,6 +191,12 @@ class Bridge:
             "addressed_to_me": addressed,
             "untrusted": untrusted,
             "resolved": message.thread_id in self._resolved,
+            "group": message.group_id,
+            "group_name": (
+                self._group_names.get(message.group_id) if message.group_id is not None else None
+            ),
+            "mentioned": message.mentioned or self.key.device_id in message.mentions,
+            "mentions": list(message.mentions),
         }
         if untrusted:
             item["label"] = UNTRUSTED_LABEL
@@ -181,7 +206,13 @@ class Bridge:
 
     # ------------------------------------------------------------ send
 
-    async def send(self, to: str, message: str, reply_to: str | None = None) -> dict[str, Any]:
+    async def send(
+        self,
+        to: str,
+        message: str,
+        reply_to: str | None = None,
+        mentions: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         """Post one message; the relay's decision, verbatim, with ``ok`` and ``reason``."""
         body = (message or "").strip()
         recipient = (to or "").strip()
@@ -189,7 +220,15 @@ class Bridge:
             return _refused("empty-message", "the message is empty")
         if not recipient:
             return _refused("no-recipient", "say who the message is for")
-        thread_id = self._thread_for(reply_to)
+        group = self._is_group(recipient)
+        if isinstance(mentions, str):
+            return _refused("malformed", "mentions is a list of assistant ids")
+        named = list(mentions or [])
+        if named and not group:
+            return _refused("malformed", "mentions are for a message to a group")
+        # A group's thread is the group id (groups contract section 8), with or without
+        # reply_to, so a reply to a group message stays in the group's thread.
+        thread_id = recipient if group else self._thread_for(reply_to)
         command = _norm(body)
         control = command.startswith((_RESOLVE, _REOPEN))
         if not control:
@@ -217,10 +256,13 @@ class Bridge:
                     "(a default, never a guarantee)",
                 )
         try:
-            envelope = Envelope.from_sender(to=(recipient,), body=body, thread_id=thread_id)
+            envelope = Envelope.from_sender(
+                to=(recipient,), body=body, thread_id=thread_id, mentions=tuple(named)
+            )
         except EnvelopeError:
             return _refused(
-                "malformed", "the recipient or the message has a shape the relay refuses"
+                "malformed",
+                "the recipient, the message or the mentions have a shape the relay refuses",
             )
         signature = signing.sign(envelope.to_json().encode("utf-8"), self.key.private_key)
         try:
@@ -290,8 +332,33 @@ class Bridge:
         for key in ("day_end", "end_date"):
             result[key] = clean(answer.get(key), 40) or None
         result["paused"] = answer.get("paused") is True
+        self._group_names = {
+            str(item["id"]): None if item["name"] is None else clean(item["name"], 80)
+            for item in listed
+            if item["kind"] == "group"
+        }
         log.info("recipients listed count=%d", len(listed))
         return result
+
+    async def _learn_group_names(self, taken: list[Received]) -> None:
+        """One ``recipients`` call at most when a group message names a group whose name
+        is not known yet; on any failure the name stays null and the inbox still answers."""
+        for message in taken:
+            if message.group_id is not None:
+                self._groups_seen.add(message.group_id)
+        if not any(m.group_id is not None and m.group_id not in self._group_names for m in taken):
+            return
+        try:
+            await self.recipients()
+        except Exception:  # noqa: BLE001 - a name lookup never fails the inbox
+            log.info("check_inbox group names unavailable")
+
+    def _is_group(self, recipient: str) -> bool:
+        return (
+            recipient in self._group_names
+            or recipient in self._groups_seen
+            or recipient.startswith(_GROUP_PREFIX)
+        )
 
     def _thread_for(self, reply_to: str | None) -> str | None:
         if not reply_to:

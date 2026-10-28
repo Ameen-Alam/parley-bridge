@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from parley_common import clock, envelope, ids
+from parley_common import clock, envelope, ids, signing
 from parley_common.envelope import Envelope, Kind
 
 BODY = "hostile body text that must never leak"
@@ -78,7 +78,8 @@ def test_to_json_is_compact_sorted_and_matches_the_schema_shape() -> None:
     env = sender_envelope()
     data = json.loads(env.to_json())
     assert list(data) == sorted(data)
-    assert set(data) == set(envelope.SENDER_FIELDS + envelope.RESERVED_FIELDS)
+    required = set(envelope.SENDER_FIELDS + envelope.RESERVED_FIELDS)
+    assert set(data) == required - set(envelope.OPTIONAL_SENDER_FIELDS)
     assert data["format_version"] == 1
     assert data["kind"] == "chat"
     assert data["to"] == ["recipient-a"]
@@ -91,7 +92,8 @@ def test_json_schema_is_a_valid_document_that_names_every_field() -> None:
     assert schema["type"] == "object"
     assert schema["additionalProperties"] is False
     assert set(schema["properties"]) == set(envelope.FIELD_NAMES)
-    assert set(schema["required"]) == set(envelope.SENDER_FIELDS + envelope.RESERVED_FIELDS)
+    required = set(envelope.SENDER_FIELDS + envelope.RESERVED_FIELDS)
+    assert set(schema["required"]) == required - set(envelope.OPTIONAL_SENDER_FIELDS)
     assert schema["properties"]["format_version"]["const"] == 1
     assert schema["properties"]["kind"]["enum"] == ["chat", "quote", "approval", "receipt"]
     schema["properties"].clear()
@@ -335,3 +337,50 @@ def test_naive_times_are_refused() -> None:
 
 def _as_kwargs(env: Envelope) -> dict[str, Any]:
     return {f.name: getattr(env, f.name) for f in dataclasses.fields(env)}
+
+
+# ---------------------------------------------------------------- T-0090: mentions
+
+
+OLD_WIRE = (
+    '{"body":"hostile body text that must never leak","business_address":null,'
+    '"commit_id":null,"expiry":null,"format_version":1,"kind":"chat",'
+    '"request_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","sent_at":"2026-10-11T10:00:00Z",'
+    '"thread_id":"thread-1","to":["recipient-a"]}'
+)
+"""An envelope's canonical JSON as written before the mentions field existed."""
+
+
+def test_envelope_mentions_round_trip() -> None:
+    """T-0090, criterion 6 (CR-10): ``mentions`` is a sender field of assistant device
+    IDs, kept through the wire form and the relay's stamp; never relay-set; its shape is
+    checked (non-empty strings, no duplicates, at most 50); an envelope without it has
+    the same canonical bytes as before, so an old signature still verifies."""
+    assert "mentions" in envelope.SENDER_FIELDS
+    assert "mentions" not in envelope.RELAY_SET_FIELDS
+    assert "mentions" not in Envelope.json_schema()["required"]
+    env = sender_envelope(thread_id="g-group", to=["g-group"], mentions=["dev-1", "dev-2"])
+    assert env.mentions == ("dev-1", "dev-2")
+    data = json.loads(env.to_json())
+    assert data["mentions"] == ["dev-1", "dev-2"]
+    assert Envelope.from_json(env.to_json()) == env
+    stamped = env.stamped_by_relay("owner-a", "device-a", "permission-a")
+    assert stamped.mentions == env.mentions
+    assert Envelope.from_json(stamped.to_json(), trusted=True) == stamped
+    # Ids only: anything else is refused, by the builder and by the parser alike.
+    for bad in ("dev-1", ["dev-1", "dev-1"], [""], [7], [f"d{n}" for n in range(51)]):
+        with pytest.raises(envelope.MalformedEnvelopeError):
+            sender_envelope(mentions=bad)
+        with pytest.raises(envelope.MalformedEnvelopeError):
+            Envelope.from_dict({**json.loads(sender_envelope().to_json()), "mentions": bad})
+    assert len(sender_envelope(mentions=[f"d{n}" for n in range(50)]).mentions) == 50
+    # Empty is absent: the old canonical bytes, and an old signature, are unchanged.
+    old = Envelope.from_json(OLD_WIRE)
+    assert old.mentions == ()
+    assert old.to_json() == OLD_WIRE
+    assert Envelope.from_json(old.to_json()).to_json() == OLD_WIRE
+    assert "mentions" not in sender_envelope(mentions=[]).to_dict()
+    pair = signing.generate_keypair()
+    signature = signing.sign(OLD_WIRE.encode("utf-8"), pair.private)
+    assert signing.verify(signature, pair.public) == OLD_WIRE.encode("utf-8")
+    assert signing.verify(signature, pair.public) == old.to_json().encode("utf-8")

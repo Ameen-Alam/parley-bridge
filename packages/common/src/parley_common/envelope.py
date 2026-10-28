@@ -4,7 +4,13 @@ An :class:`Envelope` is a frozen dataclass with three groups of fields:
 
 - **Sender fields**, set by the assistant's bridge: ``request_id`` (see
   :mod:`parley_common.ids`), ``thread_id``, ``to`` (recipient IDs), ``body``
-  (opaque text, untrusted, never shown in a repr or an error) and ``sent_at``.
+  (opaque text, untrusted, never shown in a repr or an error), ``sent_at`` and,
+  optionally, ``mentions`` (T-0090): the assistant device IDs a group message wakes
+  (CR-10). ``mentions`` is in the wire form only when it is not empty, so the canonical
+  JSON of an envelope without it is byte for byte what it was before the field existed
+  and old signatures still verify. This module checks its shape only (non-empty strings,
+  no duplicates, at most :data:`MAX_MENTIONS`); the relay decides whether each one is an
+  assistant of the group.
 - **The five reserved fields** of ruling 5 and the seven additions, item 1:
   ``kind`` (``chat`` is the only kind the test uses), ``commit_id``,
   ``expiry``, ``business_address`` and ``format_version`` (``1``). The
@@ -40,9 +46,14 @@ from parley_common import clock, ids
 
 FORMAT_VERSION = 1
 
-SENDER_FIELDS = ("request_id", "thread_id", "to", "body", "sent_at")
+SENDER_FIELDS = ("request_id", "thread_id", "to", "body", "sent_at", "mentions")
+OPTIONAL_SENDER_FIELDS = ("mentions",)
+"""Sender fields the wire form leaves out when empty, and the schema does not require."""
 RESERVED_FIELDS = ("kind", "commit_id", "expiry", "business_address", "format_version")
 RELAY_SET_FIELDS = ("owner", "sent_by", "permission_ref")
+
+MAX_MENTIONS = 50
+"""The most assistant device IDs one message may mention (T-0090)."""
 
 # A private token: only this module's relay-stamping paths hold it, so a relay
 # field can be filled only through stamped_by_relay() or from_json(trusted=True).
@@ -119,6 +130,14 @@ ENVELOPE_SCHEMA: dict[str, Any] = {
             "description": "Recipient IDs.",
         },
         "body": {"type": "string", "description": "Opaque text. Untrusted data."},
+        "mentions": {
+            "type": "array",
+            "maxItems": MAX_MENTIONS,
+            "uniqueItems": True,
+            "items": {"type": "string", "minLength": 1},
+            "description": "Assistant device IDs a group message wakes. Optional; "
+            "absent when empty.",
+        },
         "sent_at": _ISO_UTC,
         "kind": {"type": "string", "enum": [kind.value for kind in Kind]},
         "commit_id": _STRING_OR_NULL,
@@ -144,6 +163,7 @@ class Envelope:
     to: tuple[str, ...]
     body: str = field(repr=False)
     sent_at: datetime
+    mentions: tuple[str, ...] = ()
     kind: Kind = Kind.CHAT
     commit_id: str | None = None
     expiry: datetime | None = None
@@ -170,6 +190,7 @@ class Envelope:
         if self.expiry is not None:
             object.__setattr__(self, "expiry", _check_moment("expiry", self.expiry))
         _check_optional_text("business_address", self.business_address)
+        object.__setattr__(self, "mentions", _check_mentions(self.mentions))
         if type(self.format_version) is not int or self.format_version != FORMAT_VERSION:
             raise UnsupportedFormatVersionError("format_version must be the integer 1")
         for name in RELAY_SET_FIELDS:
@@ -190,11 +211,13 @@ class Envelope:
         commit_id: str | None = None,
         expiry: datetime | None = None,
         business_address: str | None = None,
+        mentions: tuple[str, ...] | list[str] = (),
     ) -> Envelope:
         """Build the envelope a sender is allowed to build: relay-set fields stay empty.
 
         ``request_id`` defaults to a fresh ID, ``thread_id`` to that ID (a first
         message starts its own thread) and ``sent_at`` to the clock's now.
+        ``mentions`` names the assistant device IDs a group message wakes.
         """
         request_id = ids.new_request_id() if request_id is None else request_id
         return cls(
@@ -207,6 +230,7 @@ class Envelope:
             commit_id=commit_id,
             expiry=expiry,
             business_address=business_address,
+            mentions=_check_mentions(mentions),
         )
 
     def stamped_by_relay(self, owner: str, sent_by: str, permission_ref: str) -> Envelope:
@@ -240,7 +264,8 @@ class Envelope:
         return copy.deepcopy(ENVELOPE_SCHEMA)
 
     def to_dict(self) -> dict[str, Any]:
-        """The wire form as a dict. Relay-set fields appear only once stamped."""
+        """The wire form as a dict. Relay-set fields appear only once stamped;
+        ``mentions`` only when it is not empty (old envelopes keep their bytes)."""
         data: dict[str, Any] = {
             "request_id": self.request_id,
             "thread_id": self.thread_id,
@@ -253,6 +278,8 @@ class Envelope:
             "business_address": self.business_address,
             "format_version": self.format_version,
         }
+        if self.mentions:
+            data["mentions"] = list(self.mentions)
         if self.is_stamped:
             for name in RELAY_SET_FIELDS:
                 data[name] = getattr(self, name)
@@ -286,6 +313,9 @@ class Envelope:
         to = data["to"]
         if not isinstance(to, list):
             raise MalformedEnvelopeError("to must be a list of recipient IDs")
+        mentions = data.get("mentions", [])
+        if not isinstance(mentions, list):
+            raise MalformedEnvelopeError("mentions must be a list of assistant device IDs")
         return cls(
             request_id=data["request_id"],
             thread_id=data["thread_id"],
@@ -300,6 +330,7 @@ class Envelope:
             owner=data.get("owner"),
             sent_by=data.get("sent_by"),
             permission_ref=data.get("permission_ref"),
+            mentions=tuple(mentions),
             _stamp=_RELAY_STAMP if trusted else None,
         )
 
@@ -353,6 +384,19 @@ def _check_recipients(value: object) -> tuple[str, ...]:
     for item in recipients:
         _check_text("to", item)
     return recipients
+
+
+def _check_mentions(value: object) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, list | tuple):
+        raise MalformedEnvelopeError("mentions must be a list of assistant device IDs")
+    mentions = tuple(value)
+    if len(mentions) > MAX_MENTIONS:
+        raise MalformedEnvelopeError("mentions names too many assistants")
+    for item in mentions:
+        _check_text("mentions", item)
+    if len(set(mentions)) != len(mentions):
+        raise MalformedEnvelopeError("mentions names an assistant twice")
+    return mentions
 
 
 def _check_moment(name: str, value: object) -> datetime:

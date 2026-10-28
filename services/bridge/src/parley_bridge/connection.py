@@ -62,6 +62,7 @@ from parley_bridge.relay import (
 )
 from parley_common import signing
 from parley_common.clock import now_iso
+from parley_common.envelope import MAX_MENTIONS
 
 log = logging.getLogger("parley_bridge.connection")
 
@@ -396,6 +397,14 @@ class Received:
     so a message in a frame is addressed unless the frame says otherwise."""
     body: str = field(repr=False)
     wakeup_id: str = field(repr=False)
+    group_id: str | None = None
+    """The group the message was sent to (the frame's ``group_id``, T-0090), or None for a
+    direct message. A group message's thread is the group id (groups contract section 8)."""
+    mentioned: bool = True
+    """The frame's ``mentioned``: true for a direct message and, in a group, true when this
+    device is in the envelope's ``mentions`` (the relay decides; default true)."""
+    mentions: tuple[str, ...] = ()
+    """The assistant device ids the sender mentioned, as the envelope carries them."""
 
     @classmethod
     def from_frame(cls, wakeup_id: str, item: dict[str, Any]) -> Received | None:
@@ -407,9 +416,14 @@ class Received:
             return None
         body = envelope.get("body")
         to = envelope.get("to")
+        group = clean(item.get("group_id"))
+        group_id = group or None
+        mentions = envelope.get("mentions")
+        mentioned = item.get("mentioned", item.get("addressed", True))
+        thread_id = str(item.get("thread_id") or envelope.get("thread_id") or request_id)
         return cls(
             request_id=request_id,
-            thread_id=str(item.get("thread_id") or envelope.get("thread_id") or request_id),
+            thread_id=group_id or thread_id,
             sender_device_id=str(item.get("sender_device_id") or envelope.get("sent_by") or ""),
             sender_owner_id=str(item.get("sender_owner_id") or envelope.get("owner") or ""),
             from_other_owner=bool(item.get("from_other_owner", True)),
@@ -419,6 +433,13 @@ class Received:
             addressed=bool(item.get("addressed", item.get("mentioned", True))),
             body=body if isinstance(body, str) else "",
             wakeup_id=wakeup_id,
+            group_id=group_id,
+            mentioned=mentioned is not False,
+            mentions=tuple(
+                clean(x)
+                for x in (mentions if isinstance(mentions, list) else [])[:MAX_MENTIONS]
+                if isinstance(x, str) and clean(x)
+            ),
         )
 
 

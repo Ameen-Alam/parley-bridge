@@ -138,15 +138,20 @@ def wakeup(
     from_other_owner: bool = True,
     thread_id: str | None = None,
     resend: bool = False,
+    group_id: str | None = None,
+    mentions: list[str] | None = None,
+    mentioned: bool | None = None,
 ) -> dict[str, Any]:
-    """A wake-up frame as the relay sends it, one message per body."""
+    """A wake-up frame as the relay sends it, one message per body. ``group_id``,
+    ``mentions`` and ``mentioned`` shape a group message as T-0090 sends it: ``to`` is the
+    group, the envelope carries the mentions, the frame says whether this device is one."""
     messages = []
     for index, body in enumerate(bodies):
         request_id = f"{wakeup_id}-m{index}"
         envelope = {
             "request_id": request_id,
             "thread_id": thread_id or request_id,
-            "to": [OWNER_A],
+            "to": [group_id] if group_id else [OWNER_A],
             "body": body,
             "sent_at": "2026-10-10T22:00:00Z",
             "kind": "chat",
@@ -158,8 +163,14 @@ def wakeup(
             "sent_by": sender_device,
             "permission_ref": "perm-1",
         }
+        if mentions:
+            envelope["mentions"] = list(mentions)
+        extra: dict[str, Any] = {}
+        if group_id is not None or mentioned is not None:
+            extra = {"group_id": group_id, "mentioned": True if mentioned is None else mentioned}
         messages.append(
             {
+                **extra,
                 "request_id": request_id,
                 "thread_id": envelope["thread_id"],
                 "sender_device_id": sender_device,
