@@ -10,7 +10,10 @@ exception message carries a body, a code, a token or an ID.
 Routes used, all built by earlier tasks except the send:
 
 - ``POST /pairing/start``, ``GET /pairing/status`` with the ID in ``X-Parley-Pairing``
-  (T-0008).
+  (T-0008). The start carries what the bridge reports about itself (T-0082; bridge
+  operation 1): ``link_type`` (:data:`LINK_TYPE`, always) and ``provider`` (the AI
+  provider the owner named with ``pair --provider``, when given). A relay from before
+  T-0082 ignores both.
 - ``POST /connect/challenge``, ``POST /connect/session``, ``GET /poll``, ``POST /ack``
   (T-0007's long-poll fallback).
 - ``POST /messages`` (T-0005 builds it; this is the contract the bridge speaks):
@@ -45,6 +48,11 @@ DEVICE_HEADER = "X-Parley-Device"
 CHALLENGE_HEADER = "X-Parley-Challenge"
 SIGNATURE_HEADER = "X-Parley-Signature"
 POLL_WAIT_SECONDS = 25.0
+LINK_TYPE = "mcp"
+"""What this bridge reports it runs through at the pairing start (T-0082): it is an MCP
+server, whichever assistant calls it. The relay shows it as reported, never checked."""
+MAX_PROVIDER_LENGTH = 40
+"""The relay keeps at most 40 characters of a reported value; the bridge sends no more."""
 """The relay's longest poll (its ``MAX_WAIT_SECONDS``)."""
 
 
@@ -85,10 +93,15 @@ class RelayClient:
 
     # ------------------------------------------------------------ pairing (T-0008)
 
-    async def pairing_start(self, public_key: str, label: str | None) -> dict[str, Any]:
-        body: dict[str, Any] = {"public_key": public_key}
+    async def pairing_start(
+        self, public_key: str, label: str | None, provider: str | None = None
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"public_key": public_key, "link_type": LINK_TYPE}
         if label:
             body["label"] = label
+        reported = clean(provider, MAX_PROVIDER_LENGTH).strip() if provider else ""
+        if reported:
+            body["provider"] = reported
         return await self._call("POST", "/pairing/start", json=body)
 
     async def pairing_status(self, pairing_id: str) -> dict[str, Any]:

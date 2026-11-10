@@ -37,11 +37,15 @@ from support import (
 )
 
 from parley_bridge.connection import (
+    AUTH_REFUSALS,
     CHALLENGE_BYTES,
     DOMAIN_PREFIX,
     JITTER,
     MAX_BACKOFF,
     MIN_BACKOFF,
+    NOT_LINKED,
+    WAITING_FOR_APPROVAL,
+    WAITING_SECONDS,
     ChallengeError,
     Connection,
     challenge_payload,
@@ -520,6 +524,54 @@ def test_a_revoked_device_ends_the_loop_as_unlinked(tmp_path: Path) -> None:
         assert connection.state.status == "unlinked" and len(refused.attempts) == 1
 
     run(scenario())
+
+
+def test_a_bridge_not_yet_approved_waits_for_approval_at_the_usual_interval(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T-0136 criterion 1 (the T-0118 review, finding 1; tester-3's note of 28 October):
+    the relay's ``not-linked`` (a key the owner has not approved yet, or unlinked) is a
+    state of its own, ``waiting-for-approval``, not ``unavailable``: the bridge tries again
+    every :data:`WAITING_SECONDS`, never a growing backoff and never faster, and connects
+    on the first try once the owner approves. A link the relay ends ``not-linked`` waits
+    the same way. The log line carries the code only."""
+
+    async def scenario() -> None:
+        refusals: list[Exception | FakeLink] = [AuthRefusedError("not-linked") for _ in range(4)]
+        opener = FakeOpener([*refusals, FakeLink()])
+        sleep = FastSleep()
+        seen: list[tuple[str, str | None]] = []
+
+        async def recording_sleep(seconds: float) -> None:
+            seen.append((connection.state.status, connection.state.code))
+            await sleep(seconds)
+
+        connection = Connection(
+            make_key(),
+            make_settings(tmp_path),
+            opener,
+            sleep=recording_sleep,
+            jitter=lambda: 1.0,
+        )
+        task, link = await started(connection, opener)
+        await settle()
+        assert sleep.delays == [WAITING_SECONDS] * 4
+        assert seen == [(WAITING_FOR_APPROVAL, NOT_LINKED)] * 4
+        assert connection.state.status == "connected" and connection.state.reconnects == 4
+        assert NOT_LINKED in AUTH_REFUSALS
+
+        link.drop("not-linked")  # unlinked from the card while connected
+        while len(opener.links) < 2:
+            await asyncio.sleep(0)
+        assert sleep.delays[4:] == [WAITING_SECONDS]
+        assert seen[4] == (WAITING_FOR_APPROVAL, NOT_LINKED)
+        await connection.stop()
+        await asyncio.wait_for(task, 5)
+
+    with caplog.at_level(logging.INFO, logger="parley_bridge.connection"):
+        run(scenario())
+    waits = [r.getMessage() for r in caplog.records if "approval" in r.getMessage()]
+    assert waits and all(m == "waiting for the owner's approval code=not-linked" for m in waits)
 
 
 def test_an_ack_with_no_link_is_left_to_the_relay_resend(tmp_path: Path) -> None:

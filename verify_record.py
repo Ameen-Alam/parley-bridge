@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Check a Parley signed record offline (story 8.2).
 
-The Parley relay signs every refusal record, every approval of a permission and every
-acceptance of the tester notice, as a JWS compact serialisation (RFC 7515) with EdDSA
+The Parley relay signs every refusal record, every approval of a permission, every
+acceptance of the tester notice, every accepted contact request and every acceptance
+of a group's assistant notice, as a JWS compact serialisation (RFC 7515) with EdDSA
 over Ed25519 (RFC 8037). This script checks such a record against the relay's published
 key set, the JSON the relay serves at ``/.well-known/parley-keys`` (an operator export
 carries a copy as ``parley-keys.json``), and prints ``valid`` or ``invalid`` with the
@@ -23,6 +24,13 @@ canonical unpadded base64url, its ``kid`` (when present) is a key of the set, an
 Ed25519 signature over ``header.payload`` verifies with that key. Compare the key set
 with the one the relay serves before you trust a verdict: a record proves something
 only against a key you got from the relay yourself.
+
+A refusal record is format version 1 or 2 (version 2, since T-0125, also signs the other
+party, ``other_id``, and the ``status`` its owner is shown); a refusal of another version
+reads invalid, as a record this script cannot vouch for. Given a record as JSON (the
+``jws`` with the fields the relay shows beside it, as ``GET /refusals`` returns it, in a
+file or in ``records.json``), every field beside the ``jws`` that the payload signs must
+equal the signed one, or the record reads invalid.
 """
 
 from __future__ import annotations
@@ -46,6 +54,19 @@ KEY_BYTES = 32
 SIGNATURE_BYTES = 64
 EXPORT_FORMAT = "parley-signed-records-1"
 _B64URL = re.compile(r"[A-Za-z0-9_-]*")
+_REFUSAL_V1 = frozenset(
+    {
+        "reason_code",
+        "request_id",
+        "owner_id",
+        "assistant_device_id",
+        "decided_at",
+        "held",
+        "format_version",
+    }
+)
+REFUSAL_KEYS: dict[int, frozenset[str]] = {1: _REFUSAL_V1, 2: _REFUSAL_V1 | {"other_id", "status"}}
+"""The signed keys of each refusal record format version this script knows (T-0125)."""
 
 VALID = 0
 INVALID = 1
@@ -154,8 +175,42 @@ def check(jws: str, keys: dict[str, VerifyKey]) -> Verdict:
             continue
         if payload is None:
             return Verdict(False, "the signature verifies but the payload is not JSON", None)
-        return Verdict(True, "", payload)
+        problem = _refusal_problem(payload)
+        return Verdict(problem is None, problem or "", payload)
     return Verdict(False, "the signature does not verify", payload)
+
+
+def _is_refusal(payload: dict[str, Any]) -> bool:
+    return "type" not in payload and "reason_code" in payload
+
+
+def _refusal_problem(payload: dict[str, Any]) -> str | None:
+    """Why a signed refusal payload is not one this script can vouch for, or None. A
+    refusal has a ``reason_code`` and no ``type``; other kinds are not judged here."""
+    if not _is_refusal(payload):
+        return None
+    version = payload.get("format_version")
+    keys = REFUSAL_KEYS.get(version) if type(version) is int else None
+    if keys is None:
+        return f"a refusal of format version {json.dumps(version)}, which this script does not know"
+    if set(payload) != keys:
+        return f"the refusal does not have exactly the signed keys of format version {version}"
+    return None
+
+
+def check_record(record: dict[str, Any], keys: dict[str, VerifyKey]) -> Verdict:
+    """Check ``record["jws"]``, then every field beside it that the payload signs: a
+    field shown beside the JWS that differs from the signed one (a tampered ``other_id``
+    or ``status``) makes the record invalid (T-0125)."""
+    verdict = check(record["jws"], keys)
+    if not verdict.valid or verdict.payload is None:
+        return verdict
+    for name in sorted(set(record) & set(verdict.payload) - {"format_version"}):
+        if record[name] != verdict.payload[name]:
+            return Verdict(
+                False, f"the record's {name} differs from the signed one", verdict.payload
+            )
+    return verdict
 
 
 def describe(verdict: Verdict) -> str:
@@ -167,6 +222,9 @@ def describe(verdict: Verdict) -> str:
             f"  {name}: {json.dumps(value, sort_keys=True)}"
             for name, value in sorted(verdict.payload.items())
         )
+        if verdict.valid and _is_refusal(verdict.payload):
+            if verdict.payload.get("format_version") == 1:
+                lines.append("not signed in format version 1: other_id, status")
     return "\n".join(lines)
 
 
@@ -187,6 +245,21 @@ def _read_jws(value: str) -> str:
         return Path(value).read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError) as error:
         raise InputError("the JWS is neither JWS text nor a readable file") from error
+
+
+def _read_record(value: str) -> dict[str, Any]:
+    """The JWS as :func:`_read_jws` reads it, or a record given as a JSON object with a
+    ``jws`` and the fields shown beside it (T-0125)."""
+    text = _read_jws(value)
+    if not text.startswith("{"):
+        return {"jws": text}
+    try:
+        record = json.loads(text)
+    except ValueError as error:
+        raise InputError("the record is not JSON") from error
+    if not isinstance(record, dict) or not isinstance(record.get("jws"), str):
+        raise InputError("the record has no jws")
+    return record
 
 
 def _records(path: str) -> list[dict[str, Any]]:
@@ -218,7 +291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         keys = load_keys(_read_json(args.keys))
         if args.records is None:
-            verdict = check(_read_jws(args.jws), keys)
+            verdict = check_record(_read_record(args.jws), keys)
             sys.stdout.write(describe(verdict) + "\n")
             return VALID if verdict.valid else INVALID
         records = _records(args.records)
@@ -226,7 +299,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not 0 <= args.index < len(records):
                 raise InputError(f"--index must be from 0 to {len(records) - 1}")
             record = records[args.index]
-            verdict = check(record["jws"], keys)
+            verdict = check_record(record, keys)
             sys.stdout.write(
                 f"record {args.index} ({record.get('kind')}, {record.get('time')})\n"
                 + describe(verdict)
@@ -238,7 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return UNREADABLE
     bad = 0
     for index, record in enumerate(records):
-        verdict = check(record["jws"], keys)
+        verdict = check_record(record, keys)
         bad += 0 if verdict.valid else 1
         result = "valid" if verdict.valid else f"invalid: {verdict.reason}"
         sys.stdout.write(f"record {index} ({record.get('kind')}, {record.get('time')}): {result}\n")

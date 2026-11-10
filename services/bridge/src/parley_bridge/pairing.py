@@ -4,7 +4,9 @@ The flow (criterion 2; bridge operations 1 and 2; T-0008's rules from its review
 
 1. A fresh Ed25519 key pair is made in memory. Pairing refuses to start when a key file
    already exists: ``unlink`` first.
-2. ``POST /pairing/start`` with the public key and the reported label. ``409
+2. ``POST /pairing/start`` with the public key, the reported label and what the bridge
+   reports about itself (T-0082): its link type, ``mcp``, and the AI provider the owner
+   named with ``--provider``, if any; the owner's card shows both as reported. ``409
    already-open``, ``503 busy``, ``429 rate-limited`` and an unreachable relay are
    retried with a backoff from 1 to 60 seconds, for at most :data:`START_PATIENCE`.
 3. The eight-character code is printed with its QR code (half blocks in the terminal,
@@ -74,6 +76,7 @@ async def pair(
     write: Writer,
     sleep: Sleep = asyncio.sleep,
     unicode: bool | None = None,
+    provider: str | None = None,
 ) -> keys.DeviceKey:
     """Run the pairing flow to its end and return the key that was stored."""
     if keys.exists(settings.key_path):
@@ -81,7 +84,7 @@ async def pair(
     pair_keys = signing.generate_keypair()
     public = pair_keys.public.to_base64url()
     for attempt in range(MAX_CODES):
-        started = await _start_with_patience(client, public, label, sleep)
+        started = await _start_with_patience(client, public, label, sleep, provider)
         pairing_id = clean(started.get("id"), 128)
         if not pairing_id:
             raise PairingError("the relay started a pairing without an ID")
@@ -113,13 +116,17 @@ async def pair(
 
 
 async def _start_with_patience(
-    client: RelayClient, public_key: str, label: str | None, sleep: Sleep
+    client: RelayClient,
+    public_key: str,
+    label: str | None,
+    sleep: Sleep,
+    provider: str | None = None,
 ) -> dict[str, Any]:
     waited = 0.0
     delay = MIN_BACKOFF
     while True:
         try:
-            return await client.pairing_start(public_key, label)
+            return await client.pairing_start(public_key, label, provider)
         except RelayRefusedError as error:
             if error.code not in RETRIED_START_CODES:
                 raise PairingError(f"the relay refused to start pairing ({error.code})") from error

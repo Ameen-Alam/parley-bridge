@@ -28,7 +28,11 @@ reliability rows; T-0007's wire protocol in :mod:`parley_relay.connection`):
   are back at most 75 seconds after it returns; held messages come in the first frame
   after the reconnect, so the 10-second rule of 6b holds from the moment the link is up.
   A relay that answers ``revoked-device`` ends the loop: the bridge is unlinked and says
-  so, instead of retrying every minute.
+  so, instead of retrying every minute. A relay that answers ``not-linked`` (the key is
+  registered but the owner has not approved it on the link sheet, or has unlinked it
+  from the card; T-0118, T-0136) puts the bridge in the state ``waiting-for-approval``:
+  it tries again every :data:`WAITING_SECONDS` (with the same jitter), never backing off
+  further and never faster, and connects on the first try after the owner approves.
 - Every wake-up frame is acknowledged. With ``PARLEY_BRIDGE_WAKE_COMMAND`` set, the
   command runs once per frame; when it fails the frame is acknowledged ``failed`` and its
   messages stay waiting on the relay (story 9.2). Otherwise the messages wait in memory
@@ -77,6 +81,13 @@ JITTER = 0.25
 STABLE_SECONDS = 5.0
 """A link that lived this long resets the backoff; a shorter one keeps doubling."""
 UNLINKED = "revoked-device"
+NOT_LINKED = "not-linked"
+"""The relay's answer for a key the owner has not approved (T-0118): the bridge waits."""
+WAITING_FOR_APPROVAL = "waiting-for-approval"
+"""The connection state while the relay answers :data:`NOT_LINKED` (T-0136)."""
+WAITING_SECONDS = 30.0
+"""How often a bridge waiting for the owner's approval tries again: one steady interval,
+no growing backoff and no retry storm (T-0136)."""
 PAYLOAD_UNKNOWN = frozenset({"unknown-payload", "bad-payload"})
 """Close reasons that say the relay does not know the payload form; the only reasons
 that switch ``auto`` from the domain-separated payload to the bare one."""
@@ -85,7 +96,14 @@ WAKE_TIMEOUT = 120.0
 SEEN_LIMIT = 10_000
 """Request IDs remembered for deduplication."""
 AUTH_REFUSALS = frozenset(
-    {"unknown-device", "bad-signature", "bad-challenge", "not-assistant", "revoked-device"}
+    {
+        "unknown-device",
+        "bad-signature",
+        "bad-challenge",
+        "not-assistant",
+        "revoked-device",
+        NOT_LINKED,
+    }
 )
 WEBSOCKET = "websocket"
 POLL = "poll"
@@ -522,6 +540,10 @@ class Connection:
                     self._set_state("unlinked", transport, code)
                     log.info("device revoked by the relay; the bridge is unlinked and stops")
                     return
+                if code == NOT_LINKED:
+                    await self._wait_for_approval(transport)
+                    delay = MIN_BACKOFF
+                    continue
                 self._set_state("refused", transport, code)
                 if code in PAYLOAD_UNKNOWN and self.settings.challenge_payload == "auto":
                     self._payload_format = "bare"
@@ -547,6 +569,10 @@ class Connection:
                     self._set_state("unlinked", link.transport, reason)
                     log.info("device revoked by the relay; the bridge is unlinked and stops")
                     return
+                if reason == NOT_LINKED:
+                    await self._wait_for_approval(link.transport)
+                    delay = MIN_BACKOFF
+                    continue
                 self._set_state("reconnecting", link.transport, reason)
                 if link.transport == POLL:
                     self._websocket_blocked = False
@@ -558,6 +584,14 @@ class Connection:
             await self._wait(delay * self._jitter())
             delay = min(delay * 2, MAX_BACKOFF)
         self._set_state("stopped", self.state.transport)
+
+    async def _wait_for_approval(self, transport: str | None) -> None:
+        """The relay answered ``not-linked``: report waiting for the owner's approval and
+        try again after :data:`WAITING_SECONDS` (T-0136), counted as a retry."""
+        self._set_state(WAITING_FOR_APPROVAL, transport, NOT_LINKED)
+        log.info("waiting for the owner's approval code=%s", NOT_LINKED)
+        self.state.reconnects += 1
+        await self._wait(WAITING_SECONDS * self._jitter())
 
     async def stop(self) -> None:
         self._stopping.set()

@@ -107,7 +107,7 @@ async def send(
     message to a group always stays in the group's thread). `mentions` lists the ids of
     the group's assistants to address (only for a group; an assistant in a group
     receives only the messages that mention it). Returns ok true with the request id, or
-    ok false with the relay's reason (not-connected, over-limit, ended, paused,
+    ok false with the relay's reason (not-connected, not-picked, over-limit, ended, paused,
     bounce-limit, recipient-cap, group-ended, bad-mention (a mentioned id is not an
     assistant of the group), held, ...) or the bridge's own (loop-guard, blocked-secret,
     text-only, thread-resolved, malformed). On ok false, stop and read reason; do not
@@ -162,11 +162,11 @@ def _settings() -> Settings:
         raise SystemExit(2) from error
 
 
-async def _pair(label: str | None) -> int:
+async def _pair(label: str | None, provider: str | None = None) -> int:
     settings = _settings()
     client = RelayClient(http_client(settings.relay_url))
     try:
-        await pairing.pair(client, settings, label=label, write=_write)
+        await pairing.pair(client, settings, label=label, write=_write, provider=provider)
     except pairing.PairingError as error:
         sys.stderr.write(f"parley-bridge: {error}\n")
         return 1
@@ -219,13 +219,18 @@ def main(argv: list[str] | None = None) -> None:
     commands = parser.add_subparsers(dest="command")
     pair_cmd = commands.add_parser("pair", help="get a code, show a QR, store the key")
     pair_cmd.add_argument("--label", default=None, help="what the owner sees as the assistant")
+    pair_cmd.add_argument(
+        "--provider",
+        default=None,
+        help="the assistant's AI provider, shown on its card as reported, not checked",
+    )
     commands.add_parser("unlink", help="delete the key file")
     commands.add_parser("status", help="say whether a key is stored")
     commands.add_parser("run", help="serve the MCP tools over stdio (the default)")
     args = parser.parse_args(argv)
     _configure_logging(args.verbose)
     if args.command == "pair":
-        raise SystemExit(asyncio.run(_pair(args.label)))
+        raise SystemExit(asyncio.run(_pair(args.label, args.provider)))
     if args.command == "unlink":
         raise SystemExit(_unlink())
     if args.command == "status":

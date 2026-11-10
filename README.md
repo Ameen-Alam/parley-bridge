@@ -14,7 +14,7 @@ installs:
 - `packages/common/`
 - `services/bridge/`
 
-The tree was built from commit `34554dd7c7f84f0b6b92420ac4764223eb743d6f` of the private Parley repository by its
+The tree was built from commit `6ae21653e348a598038c71150ce4bdb8171c9927` of the private Parley repository by its
 `scripts/public_tree.py`, which copies only these directories and refuses anything else.
 The relay, the web app and the project's internal documents are not here.
 

@@ -35,10 +35,12 @@ for what comes in and ``POST /messages`` for what goes out.
   ``mentions`` (assistant device ids) goes into the envelope's ``mentions`` field; with
   no mentions the envelope's bytes are what they were before the field existed. The
   relay's decision comes back verbatim: ``ok: true`` with the request ID, or ``ok:
-  false`` with the relay's code in ``reason`` (``not-connected``, ``over-limit``,
+  false`` with the relay's code in ``reason`` (``not-connected``, ``not-picked``, ``over-limit``,
   ``ended``, ``paused``, ``bounce-limit``, ``recipient-cap``, ``group-ended``,
   ``bad-mention``, ``held``, and the record's others) so the assistant acts on it and
-  never retries by itself (story 4.13, power user condition).
+  never retries by itself (story 4.13, power user condition). A Python caller may pass
+  the envelope's ``request_id`` and ``sent_at`` so a try again after
+  ``relay-unreachable`` is the same envelope, which the relay answers once (T-0220).
 - ``recipients()``: who the assistant may message, from the relay's
   ``GET /devices/me/recipients`` (T-0052): the recipients its owner picked, each as
   ``id``, ``name`` (as the contact gave it, or the group's name as its admin typed it;
@@ -71,6 +73,7 @@ import logging
 import re
 from collections import deque
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
 from parley_bridge.config import Settings
@@ -94,6 +97,7 @@ GROUP_NAME_LABEL = (
 
 RELAY_REASONS = (
     "not-connected",
+    "not-picked",
     "blocked",
     "over-limit",
     "ended",
@@ -105,7 +109,9 @@ RELAY_REASONS = (
     "rate-limited",
     "held",
 )
-"""The record's codes (requirements 6d, rules for both), returned verbatim."""
+"""The record's codes (requirements 6d, rules for both), returned verbatim. ``not-picked``
+(T-0070; T-0077): the recipient is an accepted contact of the owner whom the owner has
+not picked for this assistant, so the send is stopped by the owner's own pick list."""
 BRIDGE_REASONS = (
     "empty-message",
     "no-recipient",
@@ -236,8 +242,17 @@ class Bridge:
         message: str,
         reply_to: str | None = None,
         mentions: Sequence[str] | None = None,
+        *,
+        request_id: str | None = None,
+        sent_at: datetime | None = None,
     ) -> dict[str, Any]:
-        """Post one message; the relay's decision, verbatim, with ``ok`` and ``reason``."""
+        """Post one message; the relay's decision, verbatim, with ``ok`` and ``reason``.
+
+        ``request_id`` and ``sent_at`` (Python callers only; not part of the MCP tool) fix
+        the envelope's own fields, so a caller that tries the same message again after
+        ``relay-unreachable`` posts the same envelope and the relay answers a try it
+        already received with its stored answer instead of a second message (T-0220).
+        Left out, each call is a new message with a fresh request ID, as before."""
         body = (message or "").strip()
         recipient = (to or "").strip()
         if not body:
@@ -283,7 +298,12 @@ class Bridge:
                 )
         try:
             envelope = Envelope.from_sender(
-                to=(recipient,), body=body, thread_id=thread_id, mentions=tuple(named)
+                to=(recipient,),
+                body=body,
+                thread_id=thread_id,
+                mentions=tuple(named),
+                request_id=request_id,
+                sent_at=sent_at,
             )
         except EnvelopeError:
             return _refused(

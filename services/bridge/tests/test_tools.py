@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -316,6 +317,17 @@ def test_send_signs_the_envelope_and_returns_the_relay_decision_verbatim(tmp_pat
     run(scenario())
 
 
+def test_the_relay_code_list_names_not_picked() -> None:
+    """T-0077 (T-0070's code): the bridge's list of relay reason codes, and the README
+    and the send tool's description where the codes are documented, name ``not-picked``
+    with its meaning; the send test above returns every code on the list verbatim."""
+    assert "not-picked" in RELAY_REASONS and "not-picked" not in BRIDGE_REASONS
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "`not-picked` (the recipient is your owner's contact, but your owner has" in readme
+    assert "not picked them for this assistant)" in readme
+    assert "not-picked" in (server.send.__doc__ or "")
+
+
 def test_a_held_answer_without_a_retry_time_reads_held_as_before(tmp_path: Any) -> None:
     """T-0114 criterion 3 (rule 5; CR-19): the relay answers a hold on the other side
     with retry_at null, the same for every reason. The bridge reads it as before: not
@@ -491,5 +503,66 @@ def test_bodies_are_data_in_every_result_and_never_interpreted(tmp_path: Any) ->
         assert bench.route.posts == []
         assert BODY not in json.dumps(bench.connection.state.to_json())
         await bench.stop()
+
+    run(scenario())
+
+
+def test_a_send_tried_again_with_the_same_request_id_is_answered_once_by_the_relay(
+    relay: Any, tmp_path: Any
+) -> None:
+    """T-0220 criterion 4: ``Bridge.send`` with ``request_id`` and ``sent_at`` posts the
+    same envelope on every try, so against the real route a second try of a send the
+    relay already took gets the stored answer and queues nothing more; a different body
+    under that request ID is ``duplicate-request``. Without them each call is a new
+    message, as before."""
+    from datetime import UTC, datetime
+
+    from support import connect_owners, link_assistant
+
+    from parley_common import ids
+
+    owner_a, owner_b = "owner-send-c", "owner-send-b"  # the approval stand-in knows them
+    key = make_key("again-assistant")
+    relay.registry.add_person_device(owner_a, "again-phone-c")
+    relay.registry.add_assistant(owner_a, key.device_id, key.public_key)
+    relay.registry.add_person_device(owner_b, "again-phone-b")
+    try:
+        connect_owners(relay, owner_a, owner_b)
+    except AssertionError as error:  # an earlier test of this module connected them
+        assert "exists" in str(error)
+    link_assistant(relay, owner_a, key.device_id, [owner_b])
+    settings = make_settings(tmp_path, relay_url=relay.url)
+
+    async def scenario() -> None:
+        client = RelayClient(httpx.AsyncClient(base_url=relay.url))
+        connection = Connection(key, settings, FakeOpener(), sleep=FastSleep())
+        bridge = Bridge(key, settings, connection, client)
+
+        def mine(*sent: str) -> list[str]:
+            pending = relay.app.state.queue.pending_for("again-phone-b")
+            return [m.request_id for m in pending if m.request_id in sent]
+
+        try:
+            request_id = ids.new_request_id()
+            sent_at = datetime(2026, 11, 9, 11, 13, 47, tzinfo=UTC)
+            first = await bridge.send(
+                owner_b, "a fixed test line", request_id=request_id, sent_at=sent_at
+            )
+            again = await bridge.send(
+                owner_b, "a fixed test line", request_id=request_id, sent_at=sent_at
+            )
+            assert first["ok"] is True and again["ok"] is True
+            assert first["request_id"] == again["request_id"] == request_id
+            assert mine(request_id) == [request_id]
+            other = await bridge.send(
+                owner_b, "another test line", request_id=request_id, sent_at=sent_at
+            )
+            assert other["ok"] is False and other["reason"] == "duplicate-request"
+            assert mine(request_id) == [request_id]
+            fresh = await bridge.send(owner_b, "a fixed test line")
+            assert fresh["ok"] is True and fresh["request_id"] != request_id
+            assert mine(request_id, fresh["request_id"]) == [request_id, fresh["request_id"]]
+        finally:
+            await client.aclose()
 
     run(scenario())

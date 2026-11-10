@@ -88,11 +88,22 @@ def test_pair_shows_code_and_qr_then_stores_the_key_owner_only(
         try:
             claimed, key = await asyncio.gather(
                 claim_when_shown(),
-                pairing.pair(client, settings, label="test label", write=lines.append),
+                pairing.pair(
+                    client,
+                    settings,
+                    label="test label",
+                    write=lines.append,
+                    provider="Example AI, test provider",
+                ),
             )
         finally:
             await client.aclose()
         assert key.device_id == claimed["device"]["id"]
+        # T-0082 criterion 3: the relay stored what the bridge reported at the start.
+        assert claimed["sheet"]["assistant"]["reported"] == {
+            "link_type": "mcp",
+            "provider": "Example AI, test provider",
+        }
         assert not Path(claimed["png_path"]).exists()
         printed = "\n".join(lines).split("\n")
         qr_lines = [line for line in printed if set(line) & {"█", "▀", "▄"}]
@@ -139,12 +150,14 @@ class ScriptedRelay:
         self.starts = starts
         self.statuses = statuses
         self.start_calls = 0
+        self.start_bodies: list[dict[str, Any]] = []
         self.status_headers: list[str] = []
         self.status_urls: list[str] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/pairing/start":
             self.start_calls += 1
+            self.start_bodies.append(json.loads(request.content))
             status, started_body = self.starts.pop(0)
             return httpx.Response(status, json=started_body)
         assert request.url.path == "/pairing/status"
@@ -318,3 +331,45 @@ def test_an_older_relays_claim_waits_for_its_linked_flag(tmp_path: Path) -> None
     assert keys.load(settings.key_path).device_id == "dev-9"
     assert script.statuses == []
     assert any("permission is approved" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("provider", "sent"),
+    [
+        (None, None),
+        ("", None),
+        (" \n ", None),
+        ("Example AI", "Example AI"),
+        ("Example\nAI‮", "ExampleAI"),
+        ("x" * 60, "x" * 40),
+    ],
+)
+def test_the_start_reports_the_link_type_and_the_provider_when_given(
+    tmp_path: Path, provider: str | None, sent: str | None
+) -> None:
+    """T-0082 criterion 3: the bridge sends its link type, ``mcp``, at every start, and the
+    provider the owner named with ``pair --provider`` when there is one, cleaned to one
+    line of at most 40 characters (the relay's own bound; the relay cleans it again)."""
+    script = ScriptedRelay([started()], ["linked"])
+    client = RelayClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(script.handler), base_url="http://relay")
+    )
+
+    async def scenario() -> None:
+        try:
+            await pairing.pair(
+                client,
+                make_settings(tmp_path),
+                label=None,
+                write=lambda _: None,
+                sleep=FastSleep(),
+                provider=provider,
+            )
+        finally:
+            await client.aclose()
+
+    run(scenario())
+    (body,) = script.start_bodies
+    assert body["link_type"] == "mcp"
+    assert body.get("provider") == sent
+    assert "provider" in body or sent is None
